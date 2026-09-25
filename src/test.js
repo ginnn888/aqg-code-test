@@ -1,6 +1,10 @@
 // mathUtils.js
 // ฟังก์ชันง่ายๆ ไว้ให้ฝึกเขียน test ด้วย Jest
 
+function add(a, b) {
+  return a + b;
+}
+
 function subtract(a, b) {
   return a - b;
 }
