@@ -1,84 +1,128 @@
-# Managed by the Quality Gate console — reconfigure or remove it from the console.
-# The analysis is the Automated Quality Gate, pulled straight from
-# github.com/NonnaritRammaneekultawat-6609650459/test-github-marketplace on every run (ref: 1.1).
+# PR code only executes in the read-only checks job.
 name: Automated Quality Gate
-
 on:
-  pull_request:
-    branches: ["main", "test-2", "test"]
-
-permissions:
-  contents: read
-  pull-requests: write
-  statuses: write
-  checks: write
-
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+permissions: {}
+concurrency:
+  group: quality-${{ github.workflow }}-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 jobs:
-  quality-gate:
-    # This name is the status-check context a branch-protection rule requires.
-    name: Quality Gate
+  generate:
+    if: github.actor != 'github-actions[bot]' && github.actor != 'dependabot[bot]'
+      && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    env:
-      # Job-level so the SonarCloud step's `if:` can see whether the secret is set.
-      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - name: Generate tests and review without executing PR code
+        uses: NonnaritRammaneekultawat-6609650459/test-github-marketplace@2f75838610968e9183e5c2eeb4b9433011d1dd66
         with:
-          # The gate diffs against the PR base branch — it needs full history.
-          fetch-depth: 0
-
-      # No `cache: npm` here on purpose — the gate installs onto arbitrary repos,
-      # and setup-node's cache errors when there is no lockfile anywhere.
-      - name: Set up Node.js
-        uses: actions/setup-node@v5
-        with:
-          node-version: '20'
-
-      # The gate runs `npx jest --coverage` in THIS repo, so jest must resolve
-      # here. A repo without a package.json still runs the gate — it just has
-      # nothing to test and reports "skipped".
-      - name: Install dependencies
-        run: |
-          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
-            npm ci
-          elif [ -f package.json ]; then
-            npm install
-          else
-            echo "::notice::No package.json in this repository — skipping dependency install."
-          fi
-
-      # SonarCloud runs only when a SONAR_TOKEN repo secret is set; a missing
-      # sonar-project.properties must not fail the whole workflow.
-      - name: SonarCloud Scan
-        if: ${{ always() && env.SONAR_TOKEN != '' }}
-        continue-on-error: true
-        uses: sonarsource/sonarqube-scan-action@v6
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-
-      # AI review + test generation + coverage/audit/Sonar gate. Posts the full
-      # report as a PR comment and exits non-zero when the gate fails.
-      - name: Automated Quality Gate
-        if: always()
-        uses: NonnaritRammaneekultawat-6609650459/test-github-marketplace@1.1
-        with:
+          project_type: javascript
+          test_source: generated
+          gemini_model: gemini-3.1-flash-lite
+          phase: generate
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
-          sonar_token: ${{ secrets.SONAR_TOKEN }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-
-      # The gate writes the AI-generated tests to Test/ and the coverage report
-      # to coverage/ on the runner, then both are deleted with it — the PR
-      # comment only ever shows a summary table, never the actual test code.
-      # Upload them as a downloadable build artifact so they aren't lost.
-      - name: Upload generated tests + coverage
+          github_token: ${{ github.token }}
+          ai_timeout_seconds: "180"
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: quality-gate-output-${{ github.run_id }}
-          path: |
-            Test/
+          name: aq-generated-tests
+          path: .aq-generated/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+  checks:
+    needs: generate
+    if: always() && (github.actor != 'github-actions[bot]' && github.actor !=
+      'dependabot[bot]' && github.event.pull_request.head.repo.full_name ==
+      github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - id: install
+        run: npm ci --ignore-scripts
+        continue-on-error: true
+      - uses: actions/download-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: aq-generated-tests
+          path: .aq-generated
+      - name: Run tests and measure coverage without AI keys or write permissions
+        uses: NonnaritRammaneekultawat-6609650459/test-github-marketplace@2f75838610968e9183e5c2eeb4b9433011d1dd66
+        if: always()
+        with:
+          project_type: javascript
+          test_source: generated
+          phase: checks
+          install_status: ${{ steps.install.outcome }}
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarqube-scan-action@v6
+        if: always()
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quality-gate-results
+          path: |-
+            .gate-state.json
             coverage/
-          if-no-files-found: ignore
-          retention-days: 14
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+  report:
+    needs:
+      - generate
+      - checks
+    if: always() && (github.actor != 'github-actions[bot]' && github.actor !=
+      'dependabot[bot]' && github.event.pull_request.head.repo.full_name ==
+      github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: write
+    steps:
+      - uses: actions/download-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: aq-generated-tests
+          path: .aq-generated
+      - uses: actions/download-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: quality-gate-results
+          path: .
+      - name: Save tests to PR and publish results
+        uses: NonnaritRammaneekultawat-6609650459/test-github-marketplace@2f75838610968e9183e5c2eeb4b9433011d1dd66
+        with:
+          project_type: javascript
+          test_source: generated
+          gemini_model: gemini-3.1-flash-lite
+          phase: report
+          github_token: ${{ github.token }}
+          persist_tests: "true"
+          report_only: "false"
+          sonar_token: ${{ secrets.SONAR_TOKEN }}
